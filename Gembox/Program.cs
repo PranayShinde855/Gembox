@@ -343,3 +343,244 @@ class Program
 
 //////    }
 //////}
+
+
+
+
+public class PdfBuilder
+{
+    public MemoryStream Build(PdfTableOfContentDto requestDto)
+    {
+        var finalDocument = new PdfDocument();
+        finalDocument.ViewerPreferences.NonFullScreenPageMode = PdfPageMode.UseOutlines;
+
+        var tocEntries = new List<(string Title, int PagesCount)>();
+        int totalContentPages = 0;
+
+        // -----------------------------
+        // 1. MERGE CONTENT PDFs
+        // -----------------------------
+        int agendaIndex = 1;
+
+        foreach (var agenda in requestDto.AgendaDetails)
+        {
+            AddDocumentContent(finalDocument, agenda.Stream,
+                $"{agendaIndex}. {agenda.LabelText}",
+                tocEntries, ref totalContentPages, agenda);
+
+            int subIndex = 1;
+
+            foreach (var sub in agenda.SubAgenda)
+            {
+                AddDocumentContent(finalDocument, sub.Stream,
+                    $"{agendaIndex}.{subIndex}. {sub.LabelText}",
+                    tocEntries, ref totalContentPages, sub);
+
+                int childIndex = 1;
+
+                foreach (var child in sub.SubChildAgenda)
+                {
+                    AddDocumentContent(finalDocument, child.Stream,
+                        $"{agendaIndex}.{subIndex}.{childIndex++}. {child.LabelText}",
+                        tocEntries, ref totalContentPages, child);
+                }
+
+                subIndex++;
+            }
+
+            agendaIndex++;
+        }
+
+        // -----------------------------
+        // 2. CREATE TOC PDF
+        // -----------------------------
+        int headerPages, footerPages;
+
+        var tocStream = CreateTocPdf(
+            requestDto,
+            requestDto.Header,
+            requestDto.Footer,
+            out headerPages,
+            out footerPages);
+
+        var tocDocument = PdfDocument.Load(tocStream);
+        int tocPageCount = tocDocument.Pages.Count;
+
+        // Insert TOC at beginning
+        finalDocument.Pages.Kids.InsertClone(0, tocDocument.Pages);
+
+        // -----------------------------
+        // 3. BUILD PAGE MAP
+        // -----------------------------
+        var pageMap = new Dictionary<string, int>();
+        int currentPage = tocPageCount;
+
+        foreach (var entry in tocEntries)
+        {
+            pageMap[Normalize(entry.Title)] = currentPage;
+            currentPage += entry.PagesCount;
+        }
+
+        // -----------------------------
+        // 4. FIX OUTLINES
+        // -----------------------------
+        FixOutlines(finalDocument.Outlines, pageMap, finalDocument);
+
+        // -----------------------------
+        // 5. SAVE FINAL PDF
+        // -----------------------------
+        var resultStream = new MemoryStream();
+        finalDocument.Save(resultStream, SaveOptions.Pdf);
+
+        return resultStream;
+    }
+
+    // =========================================================
+    // CREATE TOC USING DOCUMENT MODEL
+    // =========================================================
+    private static MemoryStream CreateTocPdf(
+        PdfTableOfContentDto tocEntries,
+        string headerString,
+        string footerString,
+        out int headerPageCount,
+        out int footerPageCount)
+    {
+        var document = new DocumentModel();
+        var section = new Section(document);
+        document.Sections.Add(section);
+
+        headerPageCount = 0;
+        footerPageCount = 0;
+
+        // HEADER
+        if (!string.IsNullOrEmpty(headerString))
+        {
+            section.Blocks.Add(new Paragraph(document, "@header@"));
+
+            var replace = section.Content.Find("@header@").First();
+            replace.Start.LoadText(headerString, new HtmlLoadOptions()
+            {
+                InheritCharacterFormat = true
+            });
+
+            document.Content.Replace("@header@", "");
+        }
+
+        // TOC FIELD
+        var toc = new TableOfEntries(document, FieldType.TOC);
+        section.Blocks.Add(toc);
+
+        // STYLES
+        var h1 = (ParagraphStyle)document.Styles.GetOrAdd(StyleTemplateType.Heading1);
+        var h2 = (ParagraphStyle)document.Styles.GetOrAdd(StyleTemplateType.Heading2);
+        var h3 = (ParagraphStyle)document.Styles.GetOrAdd(StyleTemplateType.Heading3);
+
+        h1.ParagraphFormat.PageBreakBefore = true;
+        h2.ParagraphFormat.PageBreakBefore = true;
+        h3.ParagraphFormat.PageBreakBefore = true;
+
+        int i = 1;
+
+        foreach (var agenda in tocEntries.AgendaDetails)
+        {
+            section.Blocks.Add(new Paragraph(document,
+                $"{i}. {agenda.LabelText}")
+            { ParagraphFormat = { Style = h1 } });
+
+            int j = 1;
+
+            foreach (var sub in agenda.SubAgenda)
+            {
+                section.Blocks.Add(new Paragraph(document,
+                    $"{i}.{j}. {sub.LabelText}")
+                { ParagraphFormat = { Style = h2 } });
+
+                int k = 1;
+
+                foreach (var child in sub.SubChildAgenda)
+                {
+                    section.Blocks.Add(new Paragraph(document,
+                        $"{i}.{j}.{k++}. {child.LabelText}")
+                    { ParagraphFormat = { Style = h3 } });
+                }
+
+                j++;
+            }
+
+            i++;
+        }
+
+        document.CalculateListItems();
+        toc.Update();
+
+        var options = new PdfSaveOptions
+        {
+            BookmarksCreateOptions = PdfBookmarksCreateOptions.UsingHeadings
+        };
+
+        var stream = new MemoryStream();
+        document.Save(stream, options);
+
+        return stream;
+    }
+
+    // =========================================================
+    // ADD PDF CONTENT
+    // =========================================================
+    private void AddDocumentContent(
+        PdfDocument mainDocument,
+        Stream sourceStream,
+        string title,
+        List<(string Title, int PagesCount)> entriesList,
+        ref int totalCount,
+        dynamic agendaItem)
+    {
+        if (sourceStream == null)
+            return;
+
+        var sourceDoc = PdfDocument.Load(sourceStream);
+
+        mainDocument.Pages.Kids.AddClone(sourceDoc.Pages);
+
+        int pages = sourceDoc.Pages.Count;
+
+        agendaItem.PageCount = pages;
+        totalCount += pages;
+
+        entriesList.Add((title, pages));
+    }
+
+    // =========================================================
+    // FIX OUTLINES (RECURSIVE)
+    // =========================================================
+    private void FixOutlines(
+        PdfOutlineCollection outlines,
+        Dictionary<string, int> pageMap,
+        PdfDocument document)
+    {
+        foreach (var outline in outlines)
+        {
+            var key = Normalize(outline.Title);
+
+            if (pageMap.TryGetValue(key, out int pageIndex))
+            {
+                outline.SetDestination(
+                    document.Pages[pageIndex],
+                    PdfDestinationViewType.FitPage);
+            }
+
+            if (outline.Outlines.Count > 0)
+            {
+                FixOutlines(outline.Outlines, pageMap, document);
+            }
+        }
+    }
+
+    // =========================================================
+    // NORMALIZE TITLE
+    // =========================================================
+    private static string Normalize(string text)
+    {
+        return text?.Trim().ToLower() ?? "";
+    }
+}
